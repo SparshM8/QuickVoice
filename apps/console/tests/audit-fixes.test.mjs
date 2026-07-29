@@ -199,17 +199,43 @@ test("google oauth redirects back to the canonical console origin", () => {
   assert.doesNotMatch(links, /callbackURL:\s*["'`]\/dashboard["'`]/);
 });
 
-test("console API key creation grants explicit MCP-ready route permissions", () => {
+test("console API key creation uses organization keys without client-only fields", () => {
   const page = read("src/app/(app)/settings/api-keys/page.tsx");
-  const permissions = read("src/lib/permissions.ts");
 
-  assert.match(permissions, /agentWidget/);
-  assert.match(page, /DEFAULT_API_KEY_PERMISSIONS/);
-  assert.match(page, /PermissionMatrix/);
-  assert.match(page, /permissions:\s*normalizedPermissions\(permissions\)/);
+  assert.match(page, /organizationId:\s*orgId/);
   assert.match(page, /MCP-ready/);
   assert.match(page, /x-api-key/);
+  assert.doesNotMatch(page, /metadata:\s*\{ organizationId/);
+  assert.doesNotMatch(page, /permissions:\s*normalizedPermissions/);
   assert.doesNotMatch(page, /Do not send them as bearer tokens/);
+});
+
+test("server API key plugin grants organization-scoped default permissions", () => {
+  const source = read("../server/src/lib/auth.ts");
+
+  assert.match(source, /references:\s*"organization"/);
+  assert.match(source, /defaultPermissions:\s*apiKeyDefaultPermissions/);
+  assert.match(
+    source,
+    /agentWidget:\s*\["create", "read", "update", "delete"\]/,
+  );
+});
+
+test("MCP setup UI asks for QuickVoice API keys and renders x-api-key config", () => {
+  const generator = read("../docs/src/components/mcp/mcp-config-generator.tsx");
+  const config = read("../docs/src/lib/mcp-config.ts");
+
+  assert.match(generator, /QuickVoice API key/);
+  assert.match(
+    generator,
+    /The API key is only used to render the config below/,
+  );
+  assert.match(
+    config,
+    /"x-api-key": apiKey\.trim\(\) \|\| "YOUR_QUICKVOICE_API_KEY"/,
+  );
+  assert.doesNotMatch(generator, /MCP token|The token is only used/);
+  assert.doesNotMatch(config, /Authorization|Bearer|YOUR_QUICKVOICE_MCP_TOKEN/);
 });
 
 test("agent creation, limits, and deletion are wired", () => {
