@@ -116,6 +116,15 @@ test("importBatchCampaignRecipients persists valid and invalid file rows and sch
   ].join("\n");
 
   const repo = {
+    createBatchOutboundCalls: async (rows: unknown[]) => {
+      calls.push(["createRows", rows]);
+      return rows;
+    },
+    markBatchImported: async (campaignId: string, stats: unknown) => {
+      calls.push(["markImported", campaignId, stats]);
+    },
+  };
+  const campaignIntelligenceRepo = {
     getCampaignForImport: async (campaignId: string) => {
       calls.push(["loadCampaign", campaignId]);
       return {
@@ -128,14 +137,10 @@ test("importBatchCampaignRecipients persists valid and invalid file rows and sch
         sourceFileKey: `outbound-batches/org_123/${TEST_UPLOAD_ID}.csv`,
         sourceFileName: "file.csv",
         ringingTimeoutSeconds: 45,
+        personalizationSchemas: [],
+        experiments: [],
+        goals: [],
       };
-    },
-    createBatchOutboundCalls: async (rows: unknown[]) => {
-      calls.push(["createRows", rows]);
-      return rows;
-    },
-    markBatchImported: async (campaignId: string, stats: unknown) => {
-      calls.push(["markImported", campaignId, stats]);
     },
   };
   const queue = {
@@ -148,6 +153,7 @@ test("importBatchCampaignRecipients persists valid and invalid file rows and sch
     { campaignId: "campaign_123" },
     {
       repository: repo,
+      campaignIntelligenceRepository: campaignIntelligenceRepo,
       queue,
       readFile: async (key) => {
         calls.push(["readFile", key]);
@@ -181,8 +187,17 @@ test("importBatchCampaignRecipients persists valid and invalid file rows and sch
         city: "Mumbai",
         other_dyn_variable: "renewal",
       },
+      recipientKey: "+15550001111",
+      recipientValues: {
+        city: "Mumbai",
+        other_dyn_variable: "renewal",
+      },
       ringingTimeoutSeconds: 45,
       sourceFileName: "file.csv",
+      importError: null,
+      preflightFindings: [],
+      preflightRenderedPreview: {},
+      preflightRenderedConfigDigest: "",
     },
   });
   assert.equal(createRows[1][1].status, "FAILED");
@@ -231,6 +246,17 @@ test("importBatchCampaignRecipients rejects oversized recipient sets and marks t
         { campaignId: "campaign_oversized" },
         {
           repository: {
+            createBatchOutboundCalls: async () => {
+              rowsCreated = true;
+              return { count: 0 };
+            },
+            markBatchImported: async () => ({}),
+            markCampaignFailed: async (campaignId: string) => {
+              failedCampaignId = campaignId;
+              return { count: 1 };
+            },
+          },
+          campaignIntelligenceRepository: {
             getCampaignForImport: async (campaignId: string) => ({
               campaignId,
               organizationId: "org_123",
@@ -241,16 +267,10 @@ test("importBatchCampaignRecipients rejects oversized recipient sets and marks t
               sourceFileKey: "outbound-batches/org_123/file.csv",
               sourceFileName: "file.csv",
               ringingTimeoutSeconds: 45,
+              personalizationSchemas: [],
+              experiments: [],
+              goals: [],
             }),
-            createBatchOutboundCalls: async () => {
-              rowsCreated = true;
-              return { count: 0 };
-            },
-            markBatchImported: async () => ({}),
-            markCampaignFailed: async (campaignId: string) => {
-              failedCampaignId = campaignId;
-              return { count: 1 };
-            },
           },
           queue: {
             add: async () => undefined,

@@ -11,17 +11,28 @@ import { generateUploadUrl, readObjectBuffer } from "../../config/s3.js";
 import { BadRequestError } from "../../common/errors/badRequest.js";
 import { getOutboundBatchQueue } from "../../queues/outbound-batch.queue.js";
 import * as outboundCallRepository from "./outbound-call.repository.js";
+import * as campaignIntelligenceRepository from "./outbound-campaign-intelligence.repository.js";
 import { parseBatchRecipients } from "./outbound-batch-parser.js";
 import {
   dispatchScheduledOutboundCall,
   enforcePlanQuota,
 } from "./outbound-call.service.js";
+import {
+  buildCampaignReport,
+  preflightCampaignPersonalization,
+  validateConversionEvent,
+} from "./outbound-campaign-intelligence.service.js";
 import { hasActiveLegacySubscription } from "../billing/call-metering.service.js";
 import type {
   BatchUploadUrlQuery,
   CreateBatchCampaignArgs,
   ListBatchCampaignsArgs,
 } from "./outbound-call.schema.js";
+import type {
+  CampaignConversionEventInput,
+  CampaignExperimentDefinition,
+  CampaignPersonalizationSchemaInput,
+} from "./outbound-campaign-intelligence.schema.js";
 
 type BatchRepository = {
   getMonthlyUsage: typeof outboundCallRepository.getMonthlyUsage;
@@ -36,7 +47,7 @@ type BatchRepository = {
   markCampaignActive: typeof outboundCallRepository.markCampaignActive;
   markCampaignCompleted: typeof outboundCallRepository.markCampaignCompleted;
   markCampaignCancelled: typeof outboundCallRepository.markCampaignCancelled;
-  getBatchCampaignResults: typeof outboundCallRepository.getBatchCampaignResults;
+  markCampaignFailed: typeof outboundCallRepository.markCampaignFailed;
   listScheduledOutboundIdsForCampaign: typeof outboundCallRepository.listScheduledOutboundIdsForCampaign;
 };
 
@@ -53,6 +64,10 @@ type ImportBatchDeps = {
     BatchRepository,
     "getCampaignForImport" | "createBatchOutboundCalls" | "markBatchImported"
   > & { markCampaignFailed?: typeof outboundCallRepository.markCampaignFailed };
+  campaignIntelligenceRepository?: Pick<
+    typeof campaignIntelligenceRepository,
+    "getCampaignForImport"
+  >;
   queue?: BatchQueueLike;
   readFile?: (key: string) => Promise<Buffer>;
   now?: () => Date;
@@ -72,7 +87,7 @@ type DispatchCampaignDeps = {
 type CreateBatchCampaignDeps = {
   repository?: Pick<
     BatchRepository,
-    "getMonthlyUsage" | "getDialableNumber" | "createBatchCampaign"
+    "getMonthlyUsage" | "getDialableNumber" | "createBatchCampaign" | "markCampaignFailed"
   >;
   queue?: BatchQueueLike;
   now?: () => Date;
@@ -92,15 +107,26 @@ type GetBatchCampaignDeps = {
   repository?: Pick<BatchRepository, "getBatchCampaignDetail">;
 };
 
-type ExportBatchCampaignResultsDeps = {
-  repository?: Pick<BatchRepository, "getBatchCampaignResults">;
-};
-
 type CancelBatchCampaignDeps = {
   repository?: Pick<
     BatchRepository,
     "getBatchCampaignDetail" | "markCampaignCancelled"
   >;
+};
+
+type CreateBatchOutboundCallInput = {
+  organizationId: string;
+  userId: string | null;
+  agentId: string | null;
+  campaignId: string;
+  scheduledAt: Date | null;
+  phoneNumber: string;
+  fromNumber: string;
+  firstMessage: string | null;
+  systemPrompt: string | null;
+  optionalData: Prisma.InputJsonObject;
+  mode: typeof OutboundCallMode.campaign;
+  status: typeof CallStatus.SCHEDULED | typeof CallStatus.FAILED;
 };
 
 export async function createBatchUploadUrl(
@@ -112,13 +138,13 @@ export async function createBatchUploadUrl(
   const filePolicy = inspectBatchFile(args.fileName, args.contentType);
   if (!filePolicy) {
     throw new BadRequestError(
-      "Batch file type does not match a supported CSV or XLSX format",
+      "Batch file type does not match a supported CSV or XLSX format"
     );
   }
   const maxUploadBytes = readPositiveInteger(
     "OUTBOUND_BATCH_MAX_UPLOAD_BYTES",
     5 * 1024 * 1024,
-    50 * 1024 * 1024,
+    50 * 1024 * 1024
   );
   if (args.fileSize > maxUploadBytes) {
     throw new BadRequestError("Batch file exceeds the configured upload limit");
@@ -128,7 +154,7 @@ export async function createBatchUploadUrl(
   const uploadUrl = await createUploadUrl(
     s3Key,
     filePolicy.contentType,
-    args.fileSize,
+    args.fileSize
   );
   return {
     uploadUrl,
@@ -149,11 +175,11 @@ export async function createBatchCampaign(
     !isValidBatchStorageKey(
       args.sourceFileKey,
       args.sourceFileName,
-      args.organizationId,
+      args.organizationId
     )
   ) {
     throw new BadRequestError(
-      "Batch file reference is invalid for the active organization",
+      "Batch file reference is invalid for the active organization"
     );
   }
 
@@ -171,7 +197,7 @@ export async function createBatchCampaign(
 
   if (!dialableNumber) {
     throw new BadRequestError(
-      "From number must belong to this organization and be linked to the selected agent",
+      "From number must belong to this organization and be linked to the selected agent"
     );
   }
 
@@ -181,6 +207,21 @@ export async function createBatchCampaign(
     status: CampaignStatus.SCHEDULED,
   });
 
+  if (args.campaignIntelligence) {
+    try {
+      await campaignIntelligenceRepository.createCampaignIntelligence({
+        organizationId: args.organizationId,
+        campaignId: campaign.campaignId,
+        personalizationSchema: args.campaignIntelligence.personalizationSchema,
+        experiments: args.campaignIntelligence.experiments,
+        goals: args.campaignIntelligence.goals,
+      });
+    } catch (error) {
+      await repository.markCampaignFailed?.(campaign.campaignId);
+      throw error;
+    }
+  }
+
   await queue.add(
     "import",
     { campaignId: campaign.campaignId },
@@ -188,7 +229,7 @@ export async function createBatchCampaign(
       jobId: `outbound-batch-import-${campaign.campaignId}`,
       removeOnComplete: 100,
       removeOnFail: 200,
-    },
+    }
   );
 
   return campaign;
@@ -196,7 +237,7 @@ export async function createBatchCampaign(
 
 export async function listBatchCampaigns(
   args: ListBatchCampaignsArgs,
-  deps: ListBatchCampaignsDeps = {},
+  deps: ListBatchCampaignsDeps = {}
 ) {
   const repository = deps.repository ?? outboundCallRepository;
   return repository.listBatchCampaigns(args);
@@ -204,31 +245,15 @@ export async function listBatchCampaigns(
 
 export async function getBatchCampaignDetail(
   args: { organizationId: string; campaignId: string },
-  deps: GetBatchCampaignDeps = {},
+  deps: GetBatchCampaignDeps = {}
 ) {
   const repository = deps.repository ?? outboundCallRepository;
   return repository.getBatchCampaignDetail(args);
 }
 
-export async function exportBatchCampaignResultsCsv(
-  args: { organizationId: string; campaignId: string },
-  deps: ExportBatchCampaignResultsDeps = {},
-) {
-  const repository = deps.repository ?? outboundCallRepository;
-  const campaign = await repository.getBatchCampaignResults(args);
-  if (!campaign) {
-    throw new BadRequestError("Batch campaign not found");
-  }
-
-  return {
-    filename: `${safeFilename(campaign.name || "campaign")}-results.csv`,
-    content: buildBatchCampaignResultsCsv(campaign),
-  };
-}
-
 export async function cancelBatchCampaign(
   args: { organizationId: string; campaignId: string },
-  deps: CancelBatchCampaignDeps = {},
+  deps: CancelBatchCampaignDeps = {}
 ) {
   const repository = deps.repository ?? outboundCallRepository;
   const campaign = await repository.getBatchCampaignDetail(args);
@@ -236,10 +261,7 @@ export async function cancelBatchCampaign(
     throw new BadRequestError("Batch campaign not found");
   }
 
-  if (
-    campaign.status !== CampaignStatus.SCHEDULED &&
-    campaign.status !== CampaignStatus.PROCESSED
-  ) {
+  if (campaign.status !== CampaignStatus.SCHEDULED && campaign.status !== CampaignStatus.PROCESSED) {
     throw new BadRequestError("Only scheduled campaigns can be cancelled");
   }
 
@@ -248,66 +270,125 @@ export async function cancelBatchCampaign(
 
 export async function importBatchCampaignRecipients(
   args: { campaignId: string },
-  deps: ImportBatchDeps = {},
+  deps: ImportBatchDeps = {}
 ) {
   const repository = deps.repository ?? outboundCallRepository;
+  const campaignIntelligenceRepo =
+    deps.campaignIntelligenceRepository ?? campaignIntelligenceRepository;
   const queue = deps.queue ?? getOutboundBatchQueue();
   const readFile = deps.readFile ?? readObjectBuffer;
   const now = deps.now ?? (() => new Date());
 
-  const campaign = await repository.getCampaignForImport(args.campaignId);
+  const campaign =
+    await campaignIntelligenceRepo.getCampaignForImport(args.campaignId);
   if (!campaign) {
     throw new Error("Batch campaign not found");
   }
+
   if (!campaign.sourceFileKey) {
     throw new Error("Batch campaign source file is missing");
   }
 
-  const file = await readFile(campaign.sourceFileKey);
   let parsed;
   try {
+    const file = await readFile(campaign.sourceFileKey);
     parsed = parseBatchRecipients(
       file,
-      campaign.sourceFileName ?? "recipients.csv",
+      campaign.sourceFileName ?? "recipients.csv"
     );
   } catch (error) {
     await repository.markCampaignFailed?.(campaign.campaignId);
     throw error;
   }
+
   const recipientCount = parsed.validRows.length + parsed.invalidRows.length;
   const maxRecipients = readPositiveInteger(
     "OUTBOUND_BATCH_MAX_RECIPIENTS",
     10_000,
-    100_000,
+    100_000
   );
   if (recipientCount > maxRecipients) {
     await repository.markCampaignFailed?.(campaign.campaignId);
     throw new BadRequestError(
-      `Batch campaign exceeds the ${maxRecipients} recipient limit`,
+      `Batch campaign exceeds the ${maxRecipients} recipient limit`
     );
   }
-  const rows = [
-    ...parsed.validRows.map((row) => ({
-      organizationId: campaign.organizationId,
-      userId: campaign.userId,
-      agentId: campaign.agentId,
-      campaignId: campaign.campaignId,
-      scheduledAt: campaign.scheduledAt,
-      phoneNumber: row.phoneNumber,
-      fromNumber: campaign.fromNumber,
-      firstMessage: row.firstMessage,
-      systemPrompt: row.systemPrompt,
-      mode: OutboundCallMode.campaign,
-      status: CallStatus.SCHEDULED,
-      optionalData: {
-        rowNumber: row.rowNumber,
-        language: row.language,
-        voiceId: row.voiceId,
-        dynamicVariables: row.dynamicVariables,
-        ringingTimeoutSeconds: campaign.ringingTimeoutSeconds,
-        sourceFileName: campaign.sourceFileName,
-      } satisfies Prisma.InputJsonObject,
-    })),
+
+  const personalizationSchema = pickPersonalizationSchema(campaign);
+  const preflightRows = personalizationSchema
+    ? runPersonalizationPreflight(personalizationSchema, parsed.validRows)
+    : null;
+
+  const recipientSnapshots: {
+    organizationId: string;
+    campaignId: string;
+    schemaVersion: number;
+    rowNumber?: number | null;
+    recipientKey: string;
+    values: Record<string, string>;
+    findings: unknown[];
+    renderedConfigDigest: string;
+    renderedPreview: Record<string, string>;
+    skipped: boolean;
+    skipReason: string | null;
+  }[] = [];
+
+  let skippedRecipients = 0;
+
+  const outboundRows = [
+    ...parsed.validRows.map((row) => {
+      const preflightRow = preflightRows?.get(row.recipientKey);
+      const skipped = preflightRow?.skipped ?? false;
+      const skipReason = preflightRow?.skipReason ?? null;
+      const findings = preflightRow?.findings ?? [];
+      const renderedPreview = preflightRow?.renderedPreview ?? {};
+      const renderedConfigDigest = preflightRow?.renderedConfigDigest ?? "";
+
+      if (preflightRow) {
+        skippedRecipients += skipped ? 1 : 0;
+        recipientSnapshots.push({
+          organizationId: campaign.organizationId,
+          campaignId: campaign.campaignId,
+          schemaVersion: personalizationSchema?.version ?? 1,
+          rowNumber: row.rowNumber,
+          recipientKey: row.recipientKey,
+          values: row.values,
+          findings,
+          renderedConfigDigest,
+          renderedPreview,
+          skipped,
+          skipReason,
+        });
+      }
+
+      return {
+        organizationId: campaign.organizationId,
+        userId: campaign.userId,
+        agentId: campaign.agentId,
+        campaignId: campaign.campaignId,
+        scheduledAt: campaign.scheduledAt,
+        phoneNumber: row.phoneNumber,
+        fromNumber: campaign.fromNumber,
+        firstMessage: skipped ? null : row.firstMessage,
+        systemPrompt: skipped ? null : row.systemPrompt,
+        mode: OutboundCallMode.campaign,
+        status: skipped ? CallStatus.FAILED : CallStatus.SCHEDULED,
+        optionalData: {
+          rowNumber: row.rowNumber,
+          language: row.language,
+          voiceId: row.voiceId,
+          dynamicVariables: row.dynamicVariables,
+          recipientKey: row.recipientKey,
+          recipientValues: row.values,
+          ringingTimeoutSeconds: campaign.ringingTimeoutSeconds,
+          sourceFileName: campaign.sourceFileName,
+          importError: skipReason,
+          preflightFindings: findings,
+          preflightRenderedPreview: renderedPreview,
+          preflightRenderedConfigDigest: renderedConfigDigest,
+        } satisfies Prisma.InputJsonObject,
+      } satisfies CreateBatchOutboundCallInput;
+    }),
     ...parsed.invalidRows.map((row) => ({
       organizationId: campaign.organizationId,
       userId: campaign.userId,
@@ -329,11 +410,23 @@ export async function importBatchCampaignRecipients(
     })),
   ];
 
-  await repository.createBatchOutboundCalls(rows);
+  const validRecipients = outboundRows.filter(
+    (row) => row.status === CallStatus.SCHEDULED
+  ).length;
+  const invalidRecipients = parsed.invalidRows.length + skippedRecipients;
+
+  await Promise.all([
+    repository.createBatchOutboundCalls(outboundRows),
+    campaignIntelligenceRepository.createCampaignRecipientSnapshots(
+      recipientSnapshots
+    ),
+    createCampaignAssignments(campaign, parsed.validRows.map((row) => row.recipientKey)),
+  ]);
+
   await repository.markBatchImported(campaign.campaignId, {
-    totalRecipients: parsed.validRows.length + parsed.invalidRows.length,
-    validRecipients: parsed.validRows.length,
-    invalidRecipients: parsed.invalidRows.length,
+    totalRecipients: recipientCount,
+    validRecipients,
+    invalidRecipients,
   });
 
   await queue.add(
@@ -344,13 +437,283 @@ export async function importBatchCampaignRecipients(
       jobId: `outbound-batch-dispatch-${campaign.campaignId}`,
       removeOnComplete: 100,
       removeOnFail: 200,
-    },
+    }
   );
+}
+
+async function createCampaignAssignments(
+  campaign: Awaited<ReturnType<typeof campaignIntelligenceRepository.getCampaignForImport>>,
+  recipientKeys: string[],
+) {
+  if (!campaign || campaign.experiments.length === 0 || recipientKeys.length === 0) {
+    return { count: 0 };
+  }
+
+  const assignments: Parameters<
+    typeof campaignIntelligenceRepository.createCampaignExperimentAssignments
+  >[0] = [];
+  const uniqueKeys = [...new Set(recipientKeys)];
+
+  for (const experiment of campaign.experiments) {
+    const experimentDefinition =
+      experiment.definition as unknown as CampaignExperimentDefinition;
+    const assignmentPlan = campaignIntelligenceRepository.buildRecipientAssignments(
+      experimentDefinition,
+      uniqueKeys,
+    );
+
+    const variantIdByKey = new Map(
+      experiment.variants.map((variant) => [variant.key, variant.variantId]),
+    );
+
+    for (const assignment of assignmentPlan.assignments) {
+      const variantId = variantIdByKey.get(assignment.variantKey);
+      if (!variantId) continue;
+
+      assignments.push({
+        organizationId: campaign.organizationId,
+        campaignId: campaign.campaignId,
+        experimentId: experiment.experimentId,
+        variantId,
+        unitKey: assignment.unitKey,
+        assignmentHash: assignment.assignmentHash,
+        excluded: assignment.excluded,
+        exclusionReason: assignment.exclusionReason,
+      });
+    }
+  }
+
+  if (assignments.length === 0) return { count: 0 };
+  return campaignIntelligenceRepository.createCampaignExperimentAssignments(assignments);
+}
+
+export async function ingestCampaignConversionEvent(
+  args: {
+    organizationId: string;
+    campaignId: string;
+  } & CampaignConversionEventInput,
+) {
+  const campaign =
+    await campaignIntelligenceRepository.getCampaignForConversion(
+      args.campaignId,
+      args.organizationId
+    );
+  if (!campaign) {
+    throw new Error("Batch campaign not found");
+  }
+
+  const existing = await campaignIntelligenceRepository.hasConversionDedupeKey(
+    args.organizationId,
+    args.dedupeKey
+  );
+  const validation = validateConversionEvent(args, existing ? new Set([args.dedupeKey]) : undefined);
+  if (!validation.accepted) {
+    return {
+      campaignId: args.campaignId,
+      accepted: false,
+      canonical: validation.canonical,
+      findings: validation.findings,
+    };
+  }
+
+  const goal = campaign.goals.find((entry) => entry.key === args.goalKey);
+
+  const conversion = await campaignIntelligenceRepository.createCampaignConversionEvent({
+    organizationId: args.organizationId,
+    campaignId: args.campaignId,
+    goalId: goal?.goalId ?? null,
+    goalKey: args.goalKey,
+    dedupeKey: args.dedupeKey,
+    externalCustomerId: args.externalCustomerId,
+    occurredAt: args.occurredAt,
+    valueCents: args.valueCents,
+    currency: args.currency,
+    source: args.source,
+    evidence: args.evidence,
+    rejected: false,
+    rejectionReason: null,
+  });
+
+  const assignments = await campaignIntelligenceRepository.getAssignmentsForUnit(
+    args.campaignId,
+    args.externalCustomerId
+  );
+
+  await campaignIntelligenceRepository.createCampaignConversionAttributions(
+    assignments.map((assignment) => {
+      const experimentDefinition =
+        (assignment.experiment.definition as { version?: number } | undefined) ?? {};
+      return {
+        organizationId: args.organizationId,
+        campaignId: args.campaignId,
+        conversionId: conversion.conversionId,
+        goalId: goal?.goalId ?? null,
+        experimentId: assignment.experimentId,
+        variantId: assignment.variantId,
+        model: "first_touch",
+        policyVersion:
+          typeof experimentDefinition.version === "number"
+            ? experimentDefinition.version
+            : 1,
+        attributedValueCents: args.valueCents ?? null,
+        evidence: {
+          event: {
+            source: args.source,
+            externalCustomerId: args.externalCustomerId,
+            dedupeKey: args.dedupeKey,
+          },
+          experiment: {
+            experimentId: assignment.experimentId,
+            variantId: assignment.variantId,
+            variantKey: assignment.variant.key,
+          },
+        },
+      };
+    })
+  );
+
+  return {
+    campaignId: args.campaignId,
+    accepted: validation.accepted,
+    canonical: validation.canonical,
+    findings: validation.findings,
+    conversionId: conversion.conversionId,
+    attributedAssignments: assignments.length,
+  };
+}
+
+export async function buildBatchCampaignReport(
+  args: {
+    organizationId: string;
+    campaignId: string;
+    randomized: boolean;
+    persistReport: boolean;
+  },
+) {
+  const campaign = await campaignIntelligenceRepository.getCampaignForReport(
+    args.campaignId,
+    args.organizationId
+  );
+  if (!campaign) {
+    throw new Error("Batch campaign not found");
+  }
+
+  const assignmentsByUnit = new Map<
+    string,
+    {
+      variantKey: string;
+    }[]
+  >();
+
+  for (const assignment of campaign.experimentAssignments) {
+    if (!assignment.variant) continue;
+
+    const previous = assignmentsByUnit.get(assignment.unitKey) ?? [];
+    previous.push({
+      variantKey: assignment.variant.key,
+    });
+    assignmentsByUnit.set(assignment.unitKey, previous);
+  }
+
+  const attempts = campaign.outboundCalls.flatMap((outbound) => {
+    const unitKey = parseRecipientKey(outbound.optionalData) ?? outbound.outboundId;
+    const statusForAttempt = outbound.callLog?.status ?? outbound.status;
+    const connected =
+      statusForAttempt === CallStatus.COMPLETED ||
+      statusForAttempt === CallStatus.PROCESSED;
+    const outcome =
+      statusForAttempt === CallStatus.NOT_ANSWERED
+        ? "not_answered"
+        : statusForAttempt === CallStatus.FAILED
+          ? "failed"
+          : statusForAttempt === CallStatus.PROCESSED
+            ? "processed"
+            : statusForAttempt === CallStatus.COMPLETED
+              ? "completed"
+              : "scheduled";
+    const costCents = outbound.callLog?.callCostCents ?? 0;
+
+    const assignedVariants = assignmentsByUnit.get(unitKey);
+    if (!assignedVariants || assignedVariants.length === 0) {
+      return [
+        {
+          unitKey,
+          connected,
+          outcome,
+          costCents,
+        },
+      ];
+    }
+
+    return assignedVariants.map((assignment) => ({
+      unitKey,
+      variantKey: assignment.variantKey,
+      connected,
+      outcome,
+      costCents,
+    }));
+  });
+
+  const conversions = campaign.conversionEvents.flatMap((conversion) => {
+    const assignedVariants = assignmentsByUnit.get(conversion.externalCustomerId);
+    if (!assignedVariants || assignedVariants.length === 0) {
+      return [
+        {
+          unitKey: conversion.externalCustomerId,
+          goalKey: conversion.goalKey,
+          valueCents: conversion.valueCents ?? 0,
+        },
+      ];
+    }
+
+    return assignedVariants.map((assignment) => ({
+      unitKey: conversion.externalCustomerId,
+      variantKey: assignment.variantKey,
+      goalKey: conversion.goalKey,
+      valueCents: conversion.valueCents ?? 0,
+    }));
+  });
+
+  const campaignReport = buildCampaignReport({
+    randomized: args.randomized,
+    attempts,
+    conversions,
+  });
+
+  if (!args.persistReport) {
+    return {
+      campaignId: args.campaignId,
+      ...campaignReport,
+    };
+  }
+
+  const definitionsVersion = Math.max(
+    campaign.personalizationSchemas
+      .map((schema) => Number(schema.version))
+      .reduce((current, next) => Math.max(current, next), 0),
+    ...campaign.experiments.map((experiment) => Number(experiment.version)),
+    ...campaign.goals.map((goal) => Number(goal.version)),
+  ) || 1;
+
+  const snapshot = await campaignIntelligenceRepository.createCampaignReportSnapshot({
+    organizationId: args.organizationId,
+    campaignId: args.campaignId,
+    scope: "batch-campaign-report",
+    definitionsVersion,
+    report: campaignReport as Record<string, unknown>,
+    dataFreshnessAt: new Date(campaignReport.dataFreshnessAt),
+  });
+
+  return {
+    campaignId: args.campaignId,
+    ...campaignReport,
+    reportId: snapshot.reportId,
+  };
 }
 
 export async function dispatchBatchCampaign(
   args: { campaignId: string },
-  deps: DispatchCampaignDeps = {},
+  deps: DispatchCampaignDeps = {}
 ) {
   const repository = deps.repository ?? outboundCallRepository;
   const queue = deps.queue ?? getOutboundBatchQueue();
@@ -358,7 +721,7 @@ export async function dispatchBatchCampaign(
   if (!campaign) return;
 
   const outboundIds = await repository.listScheduledOutboundIdsForCampaign(
-    campaign.campaignId,
+    campaign.campaignId
   );
   if (outboundIds.length === 0) {
     await repository.markCampaignCompleted(campaign.campaignId);
@@ -375,14 +738,149 @@ export async function dispatchBatchCampaign(
           jobId: `outbound-call-dispatch-${outboundId}`,
           removeOnComplete: 100,
           removeOnFail: 200,
-        },
-      ),
-    ),
+        }
+      )
+    )
   );
 }
 
 export async function dispatchBatchOutboundCall(args: { outboundId: string }) {
   await dispatchScheduledOutboundCall(args.outboundId);
+}
+
+function pickPersonalizationSchema(
+  campaign: Awaited<ReturnType<typeof campaignIntelligenceRepository.getCampaignForImport>>,
+) {
+  const [schema] = campaign?.personalizationSchemas ?? [];
+  if (!schema) return null;
+
+  return {
+    version: schema.version,
+    fields: schema.fields as CampaignPersonalizationSchemaInput["fields"],
+    templates: schema.templates as Record<string, string>,
+    attribution: schema.attribution as Record<string, unknown>,
+  } as CampaignPersonalizationSchemaInput;
+}
+
+type PreflightResultMap = Map<
+  string,
+  ReturnType<typeof preflightCampaignPersonalization>["rows"][number]
+>;
+
+function runPersonalizationPreflight(
+  schema: CampaignPersonalizationSchemaInput,
+  rows: ReturnType<typeof parseBatchRecipients>["validRows"],
+): PreflightResultMap {
+  const preflight = preflightCampaignPersonalization({
+    schema,
+    recipients: rows.map((row) => ({
+      recipientKey: row.recipientKey,
+      rowNumber: row.rowNumber,
+      values: row.values,
+    })),
+    includeSensitivePreview: false,
+  });
+
+  return new Map(preflight.rows.map((row) => [row.recipientKey, row]));
+}
+
+function dispatchDelay(scheduledAt: Date | null, now: Date) {
+  if (!scheduledAt) return 0;
+  return Math.max(0, scheduledAt.getTime() - now.getTime());
+}
+
+function inspectBatchFile(fileName: string, contentType: string) {
+  const extension = extname(fileName).slice(1).toLowerCase();
+  const normalizedContentType =
+    contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  const allowedContentTypes =
+    extension === "csv"
+      ? new Set(["text/csv", "application/csv", "application/octet-stream"])
+      : extension === "xlsx"
+        ? new Set([
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/octet-stream",
+          ])
+        : null;
+
+  return allowedContentTypes?.has(normalizedContentType)
+    ? { extension, contentType: normalizedContentType }
+    : null;
+}
+
+function isValidBatchStorageKey(
+  key: string,
+  fileName: string,
+  organizationId: string
+) {
+  const extension = extname(fileName).slice(1).toLowerCase();
+  if (extension !== "csv" && extension !== "xlsx") return false;
+  const prefix = `outbound-batches/${organizationId}/`;
+  if (!key.startsWith(prefix)) return false;
+  const objectName = key.slice(prefix.length);
+
+  return new RegExp(
+    `^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.${extension}$`,
+    "i"
+  ).test(objectName);
+}
+
+function parseRecipientKey(optionalData: Prisma.JsonValue | null | undefined) {
+  if (!optionalData || typeof optionalData !== "object" || Array.isArray(optionalData)) {
+    return null;
+  }
+
+  const record = optionalData as Record<string, unknown>;
+  return (
+    valueString(record.recipient_key) ||
+    valueString(record.recipientKey) ||
+    valueString(record.recipientid) ||
+    valueString(record.recipientId) ||
+    valueNumberString(record.rowNumber) ||
+    null
+  );
+}
+
+function valueString(value: unknown) {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function valueNumberString(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : null;
+}
+
+function readPositiveInteger(
+  name: string,
+  fallback: number,
+  maximum: number
+) {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value) && value > 0 && value <= maximum
+    ? value
+    : fallback;
+}
+
+type ExportBatchCampaignResultsDeps = {
+  repository?: Pick<
+    typeof outboundCallRepository,
+    "getBatchCampaignResults"
+  >;
+};
+
+export async function exportBatchCampaignResultsCsv(
+  args: { organizationId: string; campaignId: string },
+  deps: ExportBatchCampaignResultsDeps = {},
+) {
+  const repository = deps.repository ?? outboundCallRepository;
+  const campaign = await repository.getBatchCampaignResults(args);
+  if (!campaign) {
+    throw new BadRequestError("Batch campaign not found");
+  }
+
+  return {
+    filename: `${safeFilename(campaign.name || "campaign")}-results.csv`,
+    content: buildBatchCampaignResultsCsv(campaign),
+  };
 }
 
 type CampaignResults = NonNullable<
@@ -479,11 +977,6 @@ export function buildBatchCampaignResultsCsv(campaign: CampaignResults) {
   ]
     .map((row) => row.map(csvEscape).join(","))
     .join("\n");
-}
-
-function dispatchDelay(scheduledAt: Date | null, now: Date) {
-  if (!scheduledAt) return 0;
-  return Math.max(0, scheduledAt.getTime() - now.getTime());
 }
 
 function compareCampaignResultsCalls(
@@ -692,46 +1185,4 @@ function stringValue(value: unknown) {
 
 function toIsoString(value: Date | null) {
   return value ? value.toISOString() : "";
-}
-
-function inspectBatchFile(fileName: string, contentType: string) {
-  const extension = extname(fileName).slice(1).toLowerCase();
-  const normalizedContentType =
-    contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
-  const allowedContentTypes =
-    extension === "csv"
-      ? new Set(["text/csv", "application/csv", "application/octet-stream"])
-      : extension === "xlsx"
-        ? new Set([
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            "application/octet-stream",
-          ])
-        : null;
-
-  return allowedContentTypes?.has(normalizedContentType)
-    ? { extension, contentType: normalizedContentType }
-    : null;
-}
-
-function isValidBatchStorageKey(
-  key: string,
-  fileName: string,
-  organizationId: string,
-) {
-  const extension = extname(fileName).slice(1).toLowerCase();
-  if (extension !== "csv" && extension !== "xlsx") return false;
-  const prefix = `outbound-batches/${organizationId}/`;
-  if (!key.startsWith(prefix)) return false;
-  const objectName = key.slice(prefix.length);
-  return new RegExp(
-    `^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.${extension}$`,
-    "i",
-  ).test(objectName);
-}
-
-function readPositiveInteger(name: string, fallback: number, maximum: number) {
-  const value = Number(process.env[name]);
-  return Number.isInteger(value) && value > 0 && value <= maximum
-    ? value
-    : fallback;
 }

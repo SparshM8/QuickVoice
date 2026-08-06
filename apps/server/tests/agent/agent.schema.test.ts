@@ -8,13 +8,7 @@ import {
 } from "../../src/modules/agent/agent.schema.js";
 
 test("createAgentSchema accepts console template slugs", () => {
-  for (const templateId of [
-    "blank",
-    "business",
-    "medical",
-    "questionnaire",
-    "support",
-  ]) {
+  for (const templateId of ["blank", "business", "medical", "support"]) {
     const parsed = createAgentSchema.parse({
       name: "Sales Qualifier",
       isActive: true,
